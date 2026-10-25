@@ -2,20 +2,29 @@
 
 PySide6 desktop app (Windows and macOS): paste a Spotify / Deezer / Apple Music / YouTube Music playlist link, match its tracks against the user's DJ libraries (VirtualDJ, Serato, rekordbox), preview the result as M3U, and save it.
 
-- Run: `PlaylistHelper.bat` (uses `pythonw`, no console) or `python playlist_helper.py` to see errors.
-- Setup: `pip install -r requirements.txt` (PySide6, requests, ytmusicapi, pyrekordbox).
-- Everything is in `playlist_helper.py`: library loading, playlist fetchers, matcher, UI.
+- Run from source:
+  - Windows: `PlaylistHelper.bat`. It falls back to the `py` launcher, installs missing packages on first run, then starts with `pythonw` (no console).
+  - macOS: `PlaylistHelper.command` (double-click). It creates `.venv` on first run. It must keep LF line endings (`.gitattributes`) and the executable bit (`git update-index --chmod=+x`).
+  - Either OS: `python playlist_helper.py` shows errors in the terminal.
+- Setup: `pip install -r requirements.txt` (PySide6, requests, ytmusicapi, pyrekordbox). Needs Python 3.9 or newer.
+- Everything is in `playlist_helper.py`: library loading, playlist fetchers, matcher, UI, self-test.
+- Self-test: `PlaylistHelper --selftest [report.txt]` runs headless. It checks that the bundled modules import, loads the libraries, fetches a Deezer playlist (HTTPS) and runs matching. It exits non-zero on failure.
+
+## Must work on any PC or Mac (user requirement)
+Nothing may be tied to this machine: no hardcoded user names or drive letters, no Windows-only APIs without a macOS path, and no reliance on the working directory (a packaged Mac app starts in `/`). Per-user state goes in QSettings: the checkbox, extra libraries and the last save folder.
 
 ## Building
 - `build_windows.bat` installs the requirements plus PyInstaller, then runs `build.py`, which writes `dist\PlaylistHelper.exe` (one file, about 75 MB).
-- A .dmg can only be built on a Mac. `.github/workflows/build.yml` runs `build.py` on GitHub's Windows and macOS (Apple Silicon) machines on every push to main, and uploads the .exe and .dmg as downloadable artifacts. On a Mac, `build.py` makes the .app, then the .dmg with `hdiutil`.
-- The Mac app is unsigned: on first launch, right-click it and choose Open.
+- A .dmg can only be built on a Mac. On every push to main, `.github/workflows/build.yml` builds on GitHub's Windows, macOS Apple Silicon (`macos-latest`) and macOS Intel (`macos-15-intel`) machines. It runs `--selftest` on each packaged app, then uploads the .exe and .dmg files as downloadable artifacts. On a Mac, `build.py` makes the .app, then the .dmg with `hdiutil`.
+- The Mac app is unsigned. On first launch, right-click it and choose Open. On macOS 15 or newer, go to System Settings → Privacy & Security → Open Anyway instead.
 - PyInstaller needs `--collect-all pyrekordbox sqlcipher3` and `--collect-data ytmusicapi` (already in `build.py`).
 
 ## Libraries
-- Discovery checks every drive root (Windows `C:\`–`Z:\`; macOS `/` and `/Volumes/*`) plus the home folder:
-  - VirtualDJ: `<root>/VirtualDJ/database.xml` and `~/Documents/VirtualDJ/database.xml`. The main libraries are on D: and Z:. Z: is a drive that is sometimes unplugged.
-  - Serato: `<root>/_Serato_/database V2` and `~/Music/_Serato_/database V2`. This is a binary format of nested tag/length records with UTF-16BE text. `pfil` holds a path relative to the drive the `_Serato_` folder is on. `utpc` holds the play count; a few records contain garbage in the millions, so values over 100,000 are treated as 0.
+- Discovery checks every mounted drive root (Windows: drive letters from `GetLogicalDrives`, with critical-error popups disabled for empty card readers; macOS: `/` and `/Volumes/*`), plus the user's real Documents and Music folders. On Windows these are read from the registry, because they are often moved (into OneDrive, or this PC's Music folder, which is `D:\Music`).
+  - VirtualDJ: `<root>/VirtualDJ/database.xml`, `<Documents>/VirtualDJ/database.xml`, and on macOS `~/Library/Application Support/VirtualDJ/database.xml`. The main libraries are on D: and Z:. Z: is a drive that is sometimes unplugged.
+  - A drive's own VirtualDJ database (`<root>/VirtualDJ/database.xml`) has its paths rebased onto that drive's current mount point (`rebase()`). This handles a changed drive letter, or a drive last used on the other OS.
+  - Serato: `<root>/_Serato_/database V2` and `<Music>/_Serato_/database V2`. This is a binary format of nested tag/length records with UTF-16BE text. `pfil` holds a path relative to the drive the `_Serato_` folder is on. `utpc` holds the play count; a few records contain garbage in the millions, so values over 100,000 are treated as 0.
+  - Anything not found automatically can be added with the "Add library…" button (`database.xml`, `database V2` or `master.db`). These are stored in QSettings under `extra_libraries`.
   - rekordbox: `%APPDATA%\Pioneer\rekordbox\master.db` (macOS `~/Library/Pioneer/rekordbox`). It is SQLCipher-encrypted and read via `pyrekordbox.MasterDatabase`, using `DJPlayCount`.
 - The same file listed in several libraries is merged by path. Play counts **add up across libraries** (VirtualDJ + Serato + rekordbox) and take the max within one library.
 - VirtualDJ paths without a drive letter get the database's drive added (Windows only).

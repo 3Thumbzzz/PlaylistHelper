@@ -182,10 +182,20 @@ def ratio(a: str, b: str) -> float:
 # Library discovery (Windows drive letters, macOS volumes)
 # ---------------------------------------------------------------------------
 
+if os.name == "nt":
+    import ctypes
+    import winreg
+
+    # Don't let Windows pop up "insert a disk" dialogs when probing empty card readers.
+    ctypes.windll.kernel32.SetErrorMode(0x0001)  # SEM_FAILCRITICALERRORS
+
+
 def volume_roots() -> list[str]:
     """Roots of every mounted drive: C:\\, D:\\ ... on Windows, / and /Volumes/* on macOS."""
     if os.name == "nt":
-        return [f"{c}:\\" for c in string.ascii_uppercase if os.path.isdir(f"{c}:\\")]
+        mask = ctypes.windll.kernel32.GetLogicalDrives()
+        return [f"{c}:\\" for i, c in enumerate(string.ascii_uppercase)
+                if mask >> i & 1 and os.path.isdir(f"{c}:\\")]
     roots = ["/"]
     if os.path.isdir("/Volumes"):
         roots += [os.path.join("/Volumes", v) for v in sorted(os.listdir("/Volumes"))
@@ -210,16 +220,51 @@ def _existing(paths: list[str]) -> list[str]:
     return out
 
 
-def find_databases() -> list[str]:
+def user_folders(kind: str) -> list[str]:
+    """The user's Documents or Music folder(s). On Windows these are often moved
+    (e.g. into OneDrive), so ask the shell instead of assuming ~/Documents."""
     home = os.path.expanduser("~")
+    found = []
+    if os.name == "nt":
+        value = {"Documents": "Personal", "Music": "My Music"}[kind]
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion"
+                                r"\Explorer\User Shell Folders") as key:
+                found.append(os.path.expandvars(winreg.QueryValueEx(key, value)[0]))
+        except OSError:
+            pass
+    found.append(os.path.join(home, kind))
+    return _existing(found)
+
+
+def vdj_home_folders() -> list[str]:
+    homes = [os.path.join(d, "VirtualDJ") for d in user_folders("Documents")]
+    if sys.platform == "darwin":
+        homes.append(os.path.expanduser("~/Library/Application Support/VirtualDJ"))
+    return _existing(homes)
+
+
+def find_databases() -> list[str]:
     return _existing([os.path.join(r, "VirtualDJ", "database.xml") for r in volume_roots()]
-                     + [os.path.join(home, "Documents", "VirtualDJ", "database.xml")])
+                     + [os.path.join(h, "database.xml") for h in vdj_home_folders()])
 
 
 def find_serato_folders() -> list[str]:
-    home = os.path.expanduser("~")
-    folders = [os.path.join(r, "_Serato_") for r in volume_roots()] + [os.path.join(home, "Music", "_Serato_")]
+    folders = ([os.path.join(r, "_Serato_") for r in volume_roots()]
+               + [os.path.join(m, "_Serato_") for m in user_folders("Music")])
     return [f for f in _existing(folders) if os.path.isfile(os.path.join(f, "database V2"))]
+
+
+def library_kind(path: str) -> tuple[str, str] | None:
+    """Classify a library file the user picked by hand: (library name, path to load)."""
+    name = os.path.basename(path).lower()
+    if name == "database.xml":
+        return "VirtualDJ", path
+    if name == "database v2":
+        return "Serato", os.path.dirname(path)
+    if name == "master.db":
+        return "rekordbox", os.path.dirname(path)
+    return None
 
 
 def rekordbox_folder() -> str | None:
@@ -263,15 +308,33 @@ def load_database(db_path: str) -> list[Song]:
         return _parse_database(db_path, sanitize_xml(db_path))
 
 
+FOREIGN_ROOT_RE = re.compile(r"^(?:[A-Za-z]:/|/Volumes/[^/]+/|/)")
+
+
+def rebase(path: str, root: str) -> str:
+    """Point a path from a drive's own database at where that drive is mounted now.
+    Fixes drives whose letter changed (E: -> F:) or that were last used on the
+    other OS ('E:\\Music\\x.mp3' <-> '/Volumes/Drive/Music/x.mp3')."""
+    if path.startswith("\\\\") or os.path.normcase(path).startswith(os.path.normcase(root)):
+        return path  # network share, or already on this drive
+    rel = FOREIGN_ROOT_RE.sub("", path.replace("\\", "/"))
+    return os.path.normpath(os.path.join(root, rel))
+
+
 def _parse_database(db_path: str, source) -> list[Song]:
-    drive = os.path.splitdrive(os.path.abspath(db_path))[0]
+    root = volume_root_of(db_path)
+    # A database at <drive>/VirtualDJ/database.xml only lists files on that drive.
+    parent = os.path.dirname(os.path.dirname(os.path.abspath(db_path)))
+    on_drive = root != "/" and os.path.normcase(os.path.join(parent, "")) == os.path.normcase(os.path.join(root, ""))
     songs = []
     for _, el in ET.iterparse(source, events=("end",)):
         if el.tag != "Song":
             continue
         path = el.get("FilePath", "")
-        if os.name == "nt" and path and not os.path.splitdrive(path)[0] and not path.startswith("\\\\"):
-            path = drive + ("" if path.startswith("\\") else "\\") + path
+        if path and on_drive:
+            path = rebase(path, root)
+        elif os.name == "nt" and path and not os.path.splitdrive(path)[0] and not path.startswith("\\\\"):
+            path = root.rstrip("\\") + ("" if path.startswith("\\") else "\\") + path
         if os.path.splitext(path)[1].lower() in AUDIO_EXTS:
             tags = el.find("Tags")
             infos = el.find("Infos")
@@ -384,15 +447,26 @@ class Library:
         self.sources: dict[str, int] = {}  # library name -> number of databases loaded
         self.errors: list[str] = []
 
-    def load(self) -> None:
-        jobs = [("VirtualDJ", p, load_database) for p in find_databases()]
-        jobs += [("Serato", p, load_serato) for p in find_serato_folders()]
+    def load(self, extra: list[str] = ()) -> None:
+        """Load every library found automatically, plus `extra` files the user picked
+        (a database.xml, Serato 'database V2' or rekordbox master.db)."""
+        loaders = {"VirtualDJ": load_database, "Serato": load_serato, "rekordbox": load_rekordbox}
+        jobs = [("VirtualDJ", p) for p in find_databases()]
+        jobs += [("Serato", p) for p in find_serato_folders()]
         rb = rekordbox_folder()
         if rb:
-            jobs.append(("rekordbox", rb, load_rekordbox))
+            jobs.append(("rekordbox", rb))
+        seen = {os.path.normcase(os.path.abspath(p)) for _, p in jobs}
+        for f in extra:
+            kind = library_kind(f)
+            if not kind or not os.path.exists(f):
+                self.errors.append(f"Library not found: {f}")
+            elif os.path.normcase(os.path.abspath(kind[1])) not in seen:
+                jobs.append(kind)
 
         merged: dict[str, Song] = {}
-        for name, where, loader in jobs:
+        for name, where in jobs:
+            loader = loaders[name]
             try:
                 songs = loader(where)
             except Exception as e:  # one broken library shouldn't stop the others
@@ -673,7 +747,7 @@ def safe_filename(name: str) -> str:
 
 def run_ui() -> None:
     from PySide6.QtCore import QSettings, QThread, Qt, Signal
-    from PySide6.QtGui import QFont
+    from PySide6.QtGui import QFontDatabase
     from PySide6.QtWidgets import (QApplication, QCheckBox, QFileDialog, QHBoxLayout, QLabel,
                                    QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
                                    QProgressBar, QPushButton, QSplitter, QVBoxLayout,
@@ -682,9 +756,13 @@ def run_ui() -> None:
     class LoadWorker(QThread):
         done = Signal(object)
 
+        def __init__(self, extra: list[str]):
+            super().__init__()
+            self.extra = extra
+
         def run(self):
             lib = Library()
-            lib.load()
+            lib.load(self.extra)
             self.done.emit(lib)
 
     class GenerateWorker(QThread):
@@ -742,7 +820,7 @@ def run_ui() -> None:
             top.addWidget(self.any_version)
             top.addWidget(self.gen_btn)
 
-            mono = QFont("Consolas", 9)
+            mono = QFontDatabase.systemFont(QFontDatabase.FixedFont)
             self.preview = QPlainTextEdit(readOnly=True)
             self.preview.setFont(mono)
             self.preview.setLineWrapMode(QPlainTextEdit.NoWrap)
@@ -762,24 +840,55 @@ def run_ui() -> None:
             self.save_btn = QPushButton("Save Playlist")
             self.save_btn.setEnabled(False)
             self.save_btn.clicked.connect(self.save)
+            self.add_btn = QPushButton("Add library…")
+            self.add_btn.setToolTip("Pick a VirtualDJ database.xml, Serato 'database V2' or rekordbox master.db\n"
+                                    "that wasn't found automatically. It is remembered for next time.")
+            self.add_btn.clicked.connect(self.add_library)
             self.status = QLabel("Loading DJ libraries…")
             self.bar = QProgressBar(); self.bar.setMaximumWidth(200); self.bar.setRange(0, 0)
             bottom = QHBoxLayout()
             bottom.addWidget(self.save_btn)
             bottom.addWidget(self.status, 1)
             bottom.addWidget(self.bar)
+            bottom.addWidget(self.add_btn)
 
             root = QWidget(); lay = QVBoxLayout(root)
             lay.addLayout(top); lay.addWidget(split, 1); lay.addLayout(bottom)
             self.setCentralWidget(root)
+            self.load_libraries()
 
-            self.loader = LoadWorker()
+        def extra_libraries(self) -> list[str]:
+            return [p for p in (self.settings.value("extra_libraries", [], type=list) or []) if p]
+
+        def load_libraries(self):
+            self.gen_btn.setEnabled(False)
+            self.add_btn.setEnabled(False)
+            self.status.setText("Loading DJ libraries…")
+            self.bar.setRange(0, 0); self.bar.show()
+            self.loader = LoadWorker(self.extra_libraries())
             self.loader.done.connect(self.on_loaded)
             self.loader.start()
+
+        def add_library(self):
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Add DJ library", os.path.expanduser("~"),
+                "DJ library (database.xml database*V2 master.db);;All files (*)")
+            if not path:
+                return
+            if not library_kind(path):
+                QMessageBox.warning(self, "Not a DJ library",
+                                    "Choose a VirtualDJ database.xml, a Serato 'database V2' file "
+                                    "(inside a _Serato_ folder) or a rekordbox master.db.")
+                return
+            extra = self.extra_libraries()
+            if path not in extra:
+                self.settings.setValue("extra_libraries", extra + [path])
+            self.load_libraries()
 
         def on_loaded(self, lib: Library):
             self.lib = lib
             self.bar.hide()
+            self.add_btn.setEnabled(True)
             parts = ", ".join(f"{name} ×{n}" if n > 1 else name for name, n in lib.sources.items())
             msg = f"Loaded {len(lib.songs):,} tracks from {parts or 'no libraries'}"
             self.status.setText(msg)
@@ -788,8 +897,9 @@ def run_ui() -> None:
             if lib.errors:
                 QMessageBox.warning(self, "Database errors", "\n".join(lib.errors))
             if not lib.songs:
-                QMessageBox.critical(self, "No libraries",
-                                     "No VirtualDJ, Serato or rekordbox library with music files was found.")
+                QMessageBox.warning(self, "No libraries",
+                                    "No VirtualDJ, Serato or rekordbox library with music files was found.\n\n"
+                                    "If your library is somewhere unusual, use “Add library…”.")
 
         def generate(self):
             url = self.link.text().strip()
@@ -831,18 +941,27 @@ def run_ui() -> None:
             self.gen_btn.setEnabled(True)
             QMessageBox.critical(self, "Could not load playlist", msg)
 
+        def save_folder(self) -> str:
+            # A packaged Mac app starts in "/", so never fall back to the working directory.
+            last = self.settings.value("save_dir", "", type=str)
+            candidates = [last] + [os.path.join(h, "Playlists") for h in vdj_home_folders()]
+            candidates += user_folders("Music") + [os.path.expanduser("~")]
+            return next(d for d in candidates if d and os.path.isdir(d))
+
         def save(self):
             path, _ = QFileDialog.getSaveFileName(
-                self, "Save playlist", safe_filename(self.playlist_name) + ".m3u",
+                self, "Save playlist",
+                os.path.join(self.save_folder(), safe_filename(self.playlist_name) + ".m3u"),
                 "M3U playlist (*.m3u *.m3u8)")
             if not path:
                 return
             try:
-                with open(path, "w", encoding="utf-8-sig", newline="\r\n") as f:
+                with open(path, "w", encoding="utf-8-sig", newline="\r\n" if os.name == "nt" else "\n") as f:
                     f.write(self.m3u)
             except OSError as e:
                 QMessageBox.critical(self, "Save failed", str(e))
                 return
+            self.settings.setValue("save_dir", os.path.dirname(path))
             self.status.setText(f"Saved {path}")
 
     app = QApplication(sys.argv)
@@ -851,5 +970,44 @@ def run_ui() -> None:
     sys.exit(app.exec())
 
 
+def self_test(report_path: str | None) -> int:
+    """Headless check that a (packaged) build works on this machine: bundled modules
+    import, libraries load, HTTPS works and matching runs. Used by the GitHub build."""
+    lines, ok = [], True
+
+    def log(msg: str) -> None:
+        lines.append(msg)
+
+    for mod in ("PySide6.QtWidgets", "requests", "ytmusicapi", "pyrekordbox", "sqlcipher3"):
+        try:
+            __import__(mod)
+            log(f"ok    import {mod}")
+        except Exception as e:
+            ok = False
+            log(f"FAIL  import {mod}: {e!r}")
+    lib = Library()
+    lib.load()
+    log(f"ok    libraries: {len(lib.songs):,} tracks; {lib.databases or 'none found'}; errors={lib.errors}")
+    try:  # Deezer's public API is the most reliable way to prove HTTPS + certificates work
+        name, tracks, _ = fetch_playlist("https://www.deezer.com/playlist/3155776842")
+        results = [(t, lib.match(t)) for t in tracks]
+        log(f"ok    Deezer '{name}': {len(tracks)} tracks, {sum(1 for _, s in results if s)} matched")
+        build_m3u(results, show_plays=True)
+    except Exception as e:
+        ok = False
+        log(f"FAIL  Deezer fetch: {e!r}")
+    log("PASS" if ok else "FAILED")
+    text = "\n".join(lines) + "\n"
+    if report_path:
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(text)
+    if sys.stdout:  # None in a windowed Windows build
+        print(text, end="")
+    return 0 if ok else 1
+
+
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        i = sys.argv.index("--selftest")
+        sys.exit(self_test(sys.argv[i + 1] if len(sys.argv) > i + 1 else None))
     run_ui()
