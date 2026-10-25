@@ -745,8 +745,10 @@ def safe_filename(name: str) -> str:
 # UI
 # ---------------------------------------------------------------------------
 
-def run_ui() -> None:
-    from PySide6.QtCore import QSettings, QThread, Qt, Signal
+def run_ui(smoke_test: bool = False) -> int:
+    """Run the app. With smoke_test, show the window, wait for the libraries to load,
+    then quit without any dialogs (used by --selftest to prove the GUI starts)."""
+    from PySide6.QtCore import QSettings, QThread, QTimer, Qt, Signal
     from PySide6.QtGui import QFontDatabase
     from PySide6.QtWidgets import (QApplication, QCheckBox, QFileDialog, QHBoxLayout, QLabel,
                                    QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
@@ -894,6 +896,9 @@ def run_ui() -> None:
             self.status.setText(msg)
             self.status.setToolTip("\n".join(lib.databases + lib.errors))
             self.gen_btn.setEnabled(bool(lib.songs))
+            if smoke_test:
+                QTimer.singleShot(500, QApplication.instance().quit)
+                return
             if lib.errors:
                 QMessageBox.warning(self, "Database errors", "\n".join(lib.errors))
             if not lib.songs:
@@ -967,7 +972,52 @@ def run_ui() -> None:
     app = QApplication(sys.argv)
     w = MainWindow()
     w.show()
-    sys.exit(app.exec())
+    if smoke_test:  # on_loaded() quits; this catches libraries that never finish loading
+        QTimer.singleShot(180_000, lambda: app.exit(1))
+    return app.exec()
+
+
+def log_file_path() -> str:
+    """Per-user crash log: the windowed app has no console to show errors in."""
+    if sys.platform == "darwin":
+        folder = os.path.expanduser("~/Library/Logs")
+    elif os.name == "nt":
+        folder = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "PlaylistHelper")
+    else:
+        folder = os.path.expanduser("~/.cache/PlaylistHelper")
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, "PlaylistHelper.log")
+
+
+def run_logged() -> int:
+    """run_ui(), with Python errors and native crashes written to the log file."""
+    import faulthandler
+    import traceback
+    try:
+        path = log_file_path()
+        log = open(path, "w", encoding="utf-8")
+    except OSError:
+        return run_ui()
+    faulthandler.enable(log)
+
+    def write_error(exc_type, exc, tb) -> None:
+        log.write("".join(traceback.format_exception(exc_type, exc, tb)) + "\n")
+        log.flush()
+        if sys.stderr:
+            traceback.print_exception(exc_type, exc, tb)
+
+    sys.excepthook = write_error  # errors in Qt slots and threads end up here
+    try:
+        return run_ui()
+    except Exception:
+        write_error(*sys.exc_info())
+        try:
+            from PySide6.QtWidgets import QApplication, QMessageBox
+            app = QApplication.instance() or QApplication(sys.argv)
+            QMessageBox.critical(None, "PlaylistHelper", f"PlaylistHelper could not start.\n\nDetails: {path}")
+        except Exception:
+            pass
+        return 1
 
 
 def self_test(report_path: str | None) -> int:
@@ -996,6 +1046,14 @@ def self_test(report_path: str | None) -> int:
     except Exception as e:
         ok = False
         log(f"FAIL  Deezer fetch: {e!r}")
+    try:  # the real window, so a missing Qt platform plugin or a UI error fails the build
+        rc = run_ui(smoke_test=True)
+        if rc:
+            ok = False
+        log(f"{'ok  ' if rc == 0 else 'FAIL'}  GUI window opened and loaded libraries (exit {rc})")
+    except Exception as e:
+        ok = False
+        log(f"FAIL  GUI: {e!r}")
     log("PASS" if ok else "FAILED")
     text = "\n".join(lines) + "\n"
     if report_path:
@@ -1010,4 +1068,4 @@ if __name__ == "__main__":
     if "--selftest" in sys.argv:
         i = sys.argv.index("--selftest")
         sys.exit(self_test(sys.argv[i + 1] if len(sys.argv) > i + 1 else None))
-    run_ui()
+    sys.exit(run_logged())

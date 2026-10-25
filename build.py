@@ -7,6 +7,7 @@ A Mac build has to run on a Mac (PyInstaller can't cross-compile); the GitHub
 Actions workflow in .github/workflows/build.yml does both in the cloud.
 """
 import os
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -15,6 +16,22 @@ import PyInstaller.__main__
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 NAME = "PlaylistHelper"
+# Oldest macOS the bundled Qt runs on (see the PySide6 pin in requirements.txt). Older
+# Macs get a clear "needs a newer macOS" message instead of the app silently dying.
+MIN_MACOS = "12.0"
+
+
+def finish_mac_app(app: str) -> None:
+    """Set the minimum macOS version, then re-sign (editing Info.plist breaks the
+    ad-hoc signature, and Apple Silicon kills apps with a broken signature)."""
+    plist = os.path.join(app, "Contents", "Info.plist")
+    with open(plist, "rb") as f:
+        info = plistlib.load(f)
+    info["LSMinimumSystemVersion"] = MIN_MACOS
+    with open(plist, "wb") as f:
+        plistlib.dump(info, f)
+    subprocess.run(["codesign", "--force", "--deep", "--sign", "-", app], check=True)
+    subprocess.run(["codesign", "--verify", "--deep", "--strict", "--verbose=2", app], check=True)
 
 
 def main() -> None:
@@ -38,6 +55,7 @@ def main() -> None:
     PyInstaller.__main__.run(args)
 
     if sys.platform == "darwin":
+        finish_mac_app(os.path.join("dist", f"{NAME}.app"))
         dmg = os.path.join("dist", f"{NAME}.dmg")
         staging = os.path.join("build", "dmg")
         shutil.rmtree(staging, ignore_errors=True)

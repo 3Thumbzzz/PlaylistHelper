@@ -1,4 +1,6 @@
-PySide6
+# PySide6 6.10+ needs macOS 13 (6.12: macOS 14) and 6.11+ drops Python 3.9; 6.9 runs on macOS 12+.
+# Keep MIN_MACOS in build.py in step with this.
+PySide6>=6.8,<6.10
 requests
 ytmusicapi
 pyrekordbox
