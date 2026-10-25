@@ -26,7 +26,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m pip install -r requirements.txt pyinstaller
+      - name: Install requirements (Windows)
+        if: runner.os == 'Windows'
+        run: python -m pip install -r requirements.txt pyinstaller
+      # The runner is a newer macOS than many users have, so pip would pick wheels built
+      # for it (numpy's arm64 wheel needs macOS 14). Only take wheels that run on macOS 12,
+      # the app's minimum (MIN_MACOS in build.py).
+      - name: Install requirements (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          python -m pip download -r requirements.txt pyinstaller --only-binary=:all: --platform "macosx_12_0_$(uname -m)" -d wheels
+          python -m pip install --no-index --find-links wheels -r requirements.txt pyinstaller
       - run: python build.py
 
       # Run the packaged app's self-test on a clean machine with no DJ software.

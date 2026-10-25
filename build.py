@@ -8,6 +8,7 @@ Actions workflow in .github/workflows/build.yml does both in the cloud.
 """
 import os
 import plistlib
+import re
 import shutil
 import subprocess
 import sys
@@ -19,11 +20,37 @@ NAME = "PlaylistHelper"
 # Oldest macOS the bundled Qt runs on (see the PySide6 pin in requirements.txt). Older
 # Macs get a clear "needs a newer macOS" message instead of the app silently dying.
 MIN_MACOS = "12.0"
+MACHO_MAGIC = {b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe", b"\xfe\xed\xfa\xcf", b"\xfe\xed\xfa\xce",
+               b"\xca\xfe\xba\xbe"}  # 64/32-bit, both byte orders, universal
+
+
+def check_min_macos(app: str) -> None:
+    """Fail the build if any bundled binary needs a newer macOS than MIN_MACOS. The build
+    machine runs a newer macOS than many users, and pip happily picks wheels built for it."""
+    limit = tuple(int(x) for x in MIN_MACOS.split("."))
+    too_new = []
+    for folder, _, files in os.walk(app):
+        for name in files:
+            path = os.path.join(folder, name)
+            if os.path.islink(path):
+                continue
+            with open(path, "rb") as f:
+                if f.read(4) not in MACHO_MAGIC:
+                    continue
+            out = subprocess.run(["otool", "-arch", "all", "-l", path], capture_output=True, text=True).stdout
+            # LC_BUILD_VERSION has "minos 14.0"; older binaries have LC_VERSION_MIN_MACOSX "version 10.9"
+            versions = [tuple(int(x) for x in v.split("."))
+                        for v in re.findall(r"^\s*(?:minos|version) (\d+(?:\.\d+)*)$", out, re.M)]
+            if versions and max(versions) > limit:
+                too_new.append(f"  {os.path.relpath(path, app)} needs macOS {'.'.join(map(str, max(versions)))}")
+    if too_new:
+        sys.exit(f"These files need a newer macOS than MIN_MACOS {MIN_MACOS}:\n" + "\n".join(too_new))
 
 
 def finish_mac_app(app: str) -> None:
-    """Set the minimum macOS version, then re-sign (editing Info.plist breaks the
-    ad-hoc signature, and Apple Silicon kills apps with a broken signature)."""
+    """Check every binary runs on MIN_MACOS, set it as the minimum, then re-sign (editing
+    Info.plist breaks the ad-hoc signature, and Apple Silicon kills apps with a broken one)."""
+    check_min_macos(app)
     plist = os.path.join(app, "Contents", "Info.plist")
     with open(plist, "rb") as f:
         info = plistlib.load(f)
