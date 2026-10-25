@@ -1,4 +1,7 @@
 __pycache__/
+build/
+dist/
+*.spec
 *.pyc
 *.m3u
 *.m3u8

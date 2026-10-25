@@ -1,5 +1,5 @@
 """PlaylistHelper: turn a streaming playlist link into an M3U of local files
-found in VirtualDJ database.xml files.
+found in your DJ libraries (VirtualDJ, Serato, rekordbox).
 
 Supported: Spotify, Deezer, Apple Music, YouTube Music / YouTube playlists.
 """
@@ -40,18 +40,35 @@ class Track:
 
 @dataclass
 class Song:
-    """A file entry from a VirtualDJ database."""
+    """A music file from one or more DJ libraries."""
     path: str
     author: str
     title: str
     remix: str
     length: float | None
-    playcount: int
+    plays: dict[str, int]  # play count per library, e.g. {"VirtualDJ": 12, "Serato": 3}
     # derived, filled in by finalize()
     base_title: str = ""
     remix_key: str = ""
     artist_parts: list[str] = field(default_factory=list)
     title_keys: set[str] = field(default_factory=set)
+
+    @property
+    def playcount(self) -> int:
+        return sum(self.plays.values())
+
+    def merge(self, other: Song) -> None:
+        """Fold in the same file from another library: plays add up across libraries
+        (max within one library, since a file can be listed in two of its databases)."""
+        for src, n in other.plays.items():
+            self.plays[src] = max(self.plays.get(src, 0), n)
+        changed = False
+        for attr in ("author", "title", "remix", "length"):
+            if not getattr(self, attr) and getattr(other, attr):
+                setattr(self, attr, getattr(other, attr))
+                changed = True
+        if changed:
+            self.finalize()
 
     def display(self) -> str:
         if self.author and self.title:
@@ -162,19 +179,60 @@ def ratio(a: str, b: str) -> float:
 
 
 # ---------------------------------------------------------------------------
-# VirtualDJ database
+# Library discovery (Windows drive letters, macOS volumes)
 # ---------------------------------------------------------------------------
 
+def volume_roots() -> list[str]:
+    """Roots of every mounted drive: C:\\, D:\\ ... on Windows, / and /Volumes/* on macOS."""
+    if os.name == "nt":
+        return [f"{c}:\\" for c in string.ascii_uppercase if os.path.isdir(f"{c}:\\")]
+    roots = ["/"]
+    if os.path.isdir("/Volumes"):
+        roots += [os.path.join("/Volumes", v) for v in sorted(os.listdir("/Volumes"))
+                  if not os.path.islink(os.path.join("/Volumes", v))]  # boot disk is a symlink
+    return roots
+
+
+def volume_root_of(path: str) -> str:
+    if os.name == "nt":
+        return os.path.splitdrive(os.path.abspath(path))[0] + "\\"
+    m = re.match(r"(/Volumes/[^/]+)", path)
+    return m.group(1) if m else "/"
+
+
+def _existing(paths: list[str]) -> list[str]:
+    out, seen = [], set()
+    for p in paths:
+        key = os.path.normcase(os.path.abspath(p))
+        if os.path.exists(p) and key not in seen:
+            seen.add(key)
+            out.append(p)
+    return out
+
+
 def find_databases() -> list[str]:
-    found = []
-    for letter in string.ascii_uppercase:
-        p = f"{letter}:\\VirtualDJ\\database.xml"
-        if os.path.isfile(p):
-            found.append(p)
-    docs = os.path.join(os.path.expanduser("~"), "Documents", "VirtualDJ", "database.xml")
-    if os.path.isfile(docs) and os.path.normcase(docs) not in map(os.path.normcase, found):
-        found.append(docs)
-    return found
+    home = os.path.expanduser("~")
+    return _existing([os.path.join(r, "VirtualDJ", "database.xml") for r in volume_roots()]
+                     + [os.path.join(home, "Documents", "VirtualDJ", "database.xml")])
+
+
+def find_serato_folders() -> list[str]:
+    home = os.path.expanduser("~")
+    folders = [os.path.join(r, "_Serato_") for r in volume_roots()] + [os.path.join(home, "Music", "_Serato_")]
+    return [f for f in _existing(folders) if os.path.isfile(os.path.join(f, "database V2"))]
+
+
+def rekordbox_folder() -> str | None:
+    if os.name == "nt":
+        p = os.path.join(os.environ.get("APPDATA", ""), "Pioneer", "rekordbox")
+    else:
+        p = os.path.expanduser("~/Library/Pioneer/rekordbox")
+    return p if os.path.isfile(os.path.join(p, "master.db")) else None
+
+
+# ---------------------------------------------------------------------------
+# VirtualDJ database
+# ---------------------------------------------------------------------------
 
 
 INVALID_XML_RE = re.compile("[^\t\n\r\x20-퟿-�\U00010000-\U0010ffff]")
@@ -212,7 +270,7 @@ def _parse_database(db_path: str, source) -> list[Song]:
         if el.tag != "Song":
             continue
         path = el.get("FilePath", "")
-        if path and not os.path.splitdrive(path)[0] and not path.startswith("\\\\"):
+        if os.name == "nt" and path and not os.path.splitdrive(path)[0] and not path.startswith("\\\\"):
             path = drive + ("" if path.startswith("\\") else "\\") + path
         if os.path.splitext(path)[1].lower() in AUDIO_EXTS:
             tags = el.find("Tags")
@@ -228,28 +286,127 @@ def _parse_database(db_path: str, source) -> list[Song]:
             except ValueError:
                 plays = 0
             s = Song(path=path, author=tags.get("Author", ""), title=tags.get("Title", ""),
-                     remix=tags.get("Remix", ""), length=length, playcount=plays)
+                     remix=tags.get("Remix", ""), length=length, plays={"VirtualDJ": plays})
             s.finalize()
             songs.append(s)
         el.clear()
     return songs
 
 
+# ---------------------------------------------------------------------------
+# Serato ("database V2": nested big-endian tag/length records, UTF-16 text)
+# ---------------------------------------------------------------------------
+
+SERATO_MAX_PLAYS = 100_000  # a few records hold garbage in the play-count field
+
+
+def _serato_chunks(buf: bytes):
+    i = 0
+    while i + 8 <= len(buf):
+        n = int.from_bytes(buf[i + 4:i + 8], "big")
+        yield buf[i:i + 4], buf[i + 8:i + 8 + n]
+        i += 8 + n
+
+
+def _serato_text(b: bytes | None) -> str:
+    return b.decode("utf-16-be", errors="replace").rstrip("\x00").strip() if b else ""
+
+
+def _serato_length(s: str) -> float | None:
+    try:  # "03:48.78" or "1:02:03.50"
+        secs = 0.0
+        for part in s.split(":"):
+            secs = secs * 60 + float(part)
+        return secs or None
+    except ValueError:
+        return None
+
+
+def load_serato(folder: str) -> list[Song]:
+    root = volume_root_of(folder)  # Serato stores paths relative to the drive it lives on
+    with open(os.path.join(folder, "database V2"), "rb") as f:
+        data = f.read()
+    songs = []
+    for tag, body in _serato_chunks(data):
+        if tag != b"otrk":
+            continue
+        rec = dict(_serato_chunks(body))
+        rel = _serato_text(rec.get(b"pfil"))
+        if os.path.splitext(rel)[1].lower() not in AUDIO_EXTS:
+            continue
+        path = rel if os.path.isabs(rel) or os.path.splitdrive(rel)[0] else os.path.join(root, rel)
+        plays = int.from_bytes(rec.get(b"utpc", b""), "big")
+        s = Song(path=os.path.normpath(path), author=_serato_text(rec.get(b"tart")),
+                 title=_serato_text(rec.get(b"tsng")), remix=_serato_text(rec.get(b"trmx")),
+                 length=_serato_length(_serato_text(rec.get(b"tlen"))),
+                 plays={"Serato": plays if plays <= SERATO_MAX_PLAYS else 0})
+        s.finalize()
+        songs.append(s)
+    return songs
+
+
+# ---------------------------------------------------------------------------
+# rekordbox (encrypted master.db, read through pyrekordbox)
+# ---------------------------------------------------------------------------
+
+def load_rekordbox(folder: str) -> list[Song]:
+    try:
+        from pyrekordbox import MasterDatabase
+    except ImportError:
+        from pyrekordbox import Rekordbox6Database as MasterDatabase  # pyrekordbox < 0.4
+    db = MasterDatabase(db_dir=folder)
+    try:
+        songs = []
+        for c in db.get_content():
+            path = c.FolderPath or ""
+            if os.path.splitext(path)[1].lower() not in AUDIO_EXTS:
+                continue
+            s = Song(path=os.path.normpath(path), author=c.ArtistName or "", title=c.Title or "",
+                     remix=c.RemixerName or "", length=float(c.Length) if c.Length else None,
+                     plays={"rekordbox": int(c.DJPlayCount or 0)})
+            s.finalize()
+            songs.append(s)
+        return songs
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Combined library
+# ---------------------------------------------------------------------------
+
 class Library:
     def __init__(self) -> None:
         self.songs: list[Song] = []
         self.by_title: dict[str, list[Song]] = {}
         self.titles: list[str] = []
-        self.databases: list[str] = []
+        self.databases: list[str] = []  # "VirtualDJ: D:\VirtualDJ\database.xml (83,000 tracks)"
+        self.sources: dict[str, int] = {}  # library name -> number of databases loaded
         self.errors: list[str] = []
 
     def load(self) -> None:
-        self.databases = find_databases()
-        for db in self.databases:
+        jobs = [("VirtualDJ", p, load_database) for p in find_databases()]
+        jobs += [("Serato", p, load_serato) for p in find_serato_folders()]
+        rb = rekordbox_folder()
+        if rb:
+            jobs.append(("rekordbox", rb, load_rekordbox))
+
+        merged: dict[str, Song] = {}
+        for name, where, loader in jobs:
             try:
-                self.songs.extend(load_database(db))
-            except (ET.ParseError, OSError) as e:
-                self.errors.append(f"{db}: {e}")
+                songs = loader(where)
+            except Exception as e:  # one broken library shouldn't stop the others
+                self.errors.append(f"{name} ({where}): {e}")
+                continue
+            self.databases.append(f"{name}: {where} ({len(songs):,} tracks)")
+            self.sources[name] = self.sources.get(name, 0) + 1
+            for s in songs:
+                key = os.path.normcase(os.path.normpath(s.path))
+                if key in merged:
+                    merged[key].merge(s)
+                else:
+                    merged[key] = s
+        self.songs = list(merged.values())
         for s in self.songs:
             for k in s.title_keys:
                 self.by_title.setdefault(k, []).append(s)
@@ -492,7 +649,14 @@ def build_m3u(results: list[tuple[Track, Song | None]], show_plays: bool = False
         if song is None:
             continue
         secs = int(round(song.length)) if song.length else -1
-        plays = f"    [{song.playcount} play{'' if song.playcount == 1 else 's'}]" if show_plays else ""
+        plays = ""
+        if show_plays:
+            n = song.playcount
+            plays = f"    [{n} play{'' if n == 1 else 's'}"
+            used = [f"{src} {c}" for src, c in song.plays.items() if c]
+            if len(used) > 1:
+                plays += ": " + ", ".join(used)
+            plays += "]"
         lines.append(f"#EXTINF:{secs},{song.display()}{plays}")
         lines.append(song.path)
     return "\n".join(lines) + "\n"
@@ -584,7 +748,7 @@ def run_ui() -> None:
             self.preview.setLineWrapMode(QPlainTextEdit.NoWrap)
             self.preview.setPlaceholderText("M3U preview will appear here")
             self.missing = QPlainTextEdit(readOnly=True)
-            self.missing.setPlaceholderText("Songs not found in your VirtualDJ databases")
+            self.missing.setPlaceholderText("Songs not found in your DJ libraries")
 
             left = QWidget(); ll = QVBoxLayout(left); ll.setContentsMargins(0, 0, 0, 0)
             ll.addWidget(QLabel("Playlist preview")); ll.addWidget(self.preview)
@@ -598,7 +762,7 @@ def run_ui() -> None:
             self.save_btn = QPushButton("Save Playlist")
             self.save_btn.setEnabled(False)
             self.save_btn.clicked.connect(self.save)
-            self.status = QLabel("Loading VirtualDJ databases…")
+            self.status = QLabel("Loading DJ libraries…")
             self.bar = QProgressBar(); self.bar.setMaximumWidth(200); self.bar.setRange(0, 0)
             bottom = QHBoxLayout()
             bottom.addWidget(self.save_btn)
@@ -616,15 +780,16 @@ def run_ui() -> None:
         def on_loaded(self, lib: Library):
             self.lib = lib
             self.bar.hide()
-            msg = f"Loaded {len(lib.songs):,} tracks from {len(lib.databases)} database(s)"
+            parts = ", ".join(f"{name} ×{n}" if n > 1 else name for name, n in lib.sources.items())
+            msg = f"Loaded {len(lib.songs):,} tracks from {parts or 'no libraries'}"
             self.status.setText(msg)
             self.status.setToolTip("\n".join(lib.databases + lib.errors))
             self.gen_btn.setEnabled(bool(lib.songs))
             if lib.errors:
                 QMessageBox.warning(self, "Database errors", "\n".join(lib.errors))
             if not lib.songs:
-                QMessageBox.critical(self, "No databases",
-                                     "No VirtualDJ database.xml with music files was found.")
+                QMessageBox.critical(self, "No libraries",
+                                     "No VirtualDJ, Serato or rekordbox library with music files was found.")
 
         def generate(self):
             url = self.link.text().strip()
