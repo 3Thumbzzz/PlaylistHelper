@@ -46,3 +46,51 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.file }}
           if-no-files-found: error
+
+  # Keep one always-current "latest" release with the newest .exe and .dmg files.
+  # Only runs when every build (and its self-test) succeeded.
+  release:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Name the files per platform
+        run: |
+          mkdir release
+          cp artifacts/PlaylistHelper-Windows/PlaylistHelper.exe release/PlaylistHelper-Windows.exe
+          cp artifacts/PlaylistHelper-macOS-AppleSilicon/PlaylistHelper.dmg release/PlaylistHelper-macOS-AppleSilicon.dmg
+          cp artifacts/PlaylistHelper-macOS-Intel/PlaylistHelper.dmg release/PlaylistHelper-macOS-Intel.dmg
+      - name: Point the "latest" tag at this commit
+        run: |
+          gh api -X PATCH "repos/$GH_REPO/git/refs/tags/latest" -f sha="$GITHUB_SHA" -F force=true \
+            || gh api "repos/$GH_REPO/git/refs" -f ref=refs/tags/latest -f sha="$GITHUB_SHA"
+      - name: Publish the release
+        run: |
+          cat > notes.md <<EOF
+          Newest build of \`main\` (commit ${GITHUB_SHA::7}, $(date -u '+%Y-%m-%d %H:%M UTC')). This release is replaced on every push.
+
+          | Download | For |
+          |---|---|
+          | **PlaylistHelper-Windows.exe** | Windows 10/11. Just run it. If SmartScreen warns, click *More info → Run anyway*. |
+          | **PlaylistHelper-macOS-AppleSilicon.dmg** | Macs with M1 or newer |
+          | **PlaylistHelper-macOS-Intel.dmg** | Older Intel Macs |
+
+          **Mac:** open the .dmg and drag PlaylistHelper to Applications. The app is unsigned, so the first time, right-click it and choose *Open*. On macOS 15 or newer, try to open it once, then go to *System Settings → Privacy & Security → Open Anyway*. Allow access to Documents, Music and external drives when asked, so it can read your DJ libraries.
+          EOF
+          if gh release view latest >/dev/null 2>&1; then
+            gh release edit latest --title "Latest build" --notes-file notes.md --latest
+          else
+            gh release create latest --title "Latest build" --notes-file notes.md --latest
+          fi
+          gh release upload latest release/* --clobber

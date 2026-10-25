@@ -15,7 +15,7 @@ Nothing may be tied to this machine: no hardcoded user names or drive letters, n
 
 ## Building
 - `build_windows.bat` installs the requirements plus PyInstaller, then runs `build.py`, which writes `dist\PlaylistHelper.exe` (one file, about 75 MB).
-- A .dmg can only be built on a Mac. On every push to main, `.github/workflows/build.yml` builds on GitHub's Windows, macOS Apple Silicon (`macos-latest`) and macOS Intel (`macos-15-intel`) machines. It runs `--selftest` on each packaged app, then uploads the .exe and .dmg files as downloadable artifacts. On a Mac, `build.py` makes the .app, then the .dmg with `hdiutil`.
+- A .dmg can only be built on a Mac. On every push to main, `.github/workflows/build.yml` builds on GitHub's Windows, macOS Apple Silicon (`macos-latest`) and macOS Intel (`macos-15-intel`) machines. It runs `--selftest` on each packaged app, then uploads the .exe and .dmg files as downloadable artifacts. If all three succeed, a `release` job moves the `latest` tag to the commit and replaces the files on the single always-latest GitHub release ("Latest build"): `PlaylistHelper-Windows.exe`, `PlaylistHelper-macOS-AppleSilicon.dmg` and `PlaylistHelper-macOS-Intel.dmg`. The user chose this over versioned tags. On a Mac, `build.py` makes the .app, then the .dmg with `hdiutil`.
 - The Mac app is unsigned. On first launch, right-click it and choose Open. On macOS 15 or newer, go to System Settings → Privacy & Security → Open Anyway instead.
 - PyInstaller needs `--collect-all pyrekordbox sqlcipher3` and `--collect-data ytmusicapi` (already in `build.py`).
 
