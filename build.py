@@ -99,4 +99,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (SystemExit, Exception) as e:
+        if os.environ.get("GITHUB_ACTIONS") and getattr(e, "code", 1) not in (0, None):
+            # Show the reason on the workflow run page (job logs need a GitHub login)
+            msg = str(e.code if isinstance(e, SystemExit) else repr(e))
+            print("::error title=build.py failed::" + msg.replace("%", "%25").replace("\n", "%0A"))
+        raise
