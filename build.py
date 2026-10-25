@@ -38,9 +38,18 @@ def check_min_macos(app: str) -> None:
                 if f.read(4) not in MACHO_MAGIC:
                     continue
             out = subprocess.run(["otool", "-arch", "all", "-l", path], capture_output=True, text=True).stdout
-            # LC_BUILD_VERSION has "minos 14.0"; older binaries have LC_VERSION_MIN_MACOSX "version 10.9"
-            versions = [tuple(int(x) for x in v.split("."))
-                        for v in re.findall(r"^\s*(?:minos|version) (\d+(?:\.\d+)*)$", out, re.M)]
+            # LC_BUILD_VERSION has "minos 14.0"; older binaries have LC_VERSION_MIN_MACOSX "version 10.9".
+            # Other load commands (LC_SOURCE_VERSION) also print "version", so look only in these two.
+            versions = []
+            for cmd in re.split(r"^Load command \d+$", out, flags=re.M):
+                if re.search(r"^\s*cmd LC_BUILD_VERSION$", cmd, re.M):
+                    v = re.search(r"^\s*minos (\d+(?:\.\d+)*)$", cmd, re.M)
+                elif re.search(r"^\s*cmd LC_VERSION_MIN_MACOSX$", cmd, re.M):
+                    v = re.search(r"^\s*version (\d+(?:\.\d+)*)$", cmd, re.M)
+                else:
+                    continue
+                if v:
+                    versions.append(tuple(int(x) for x in v.group(1).split(".")))
             if versions and max(versions) > limit:
                 too_new.append(f"  {os.path.relpath(path, app)} needs macOS {'.'.join(map(str, max(versions)))}")
     if too_new:
